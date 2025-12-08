@@ -4,6 +4,7 @@ import sgMail from '@sendgrid/mail';
 import { ScheduledEmailCampaignModel } from '../Schema_Models/ScheduledEmailCampaign.js';
 import { EmailCampaignModel } from '../Schema_Models/EmailCampaign.js';
 import { CampaignBookingModel } from '../Schema_Models/CampaignBooking.js';
+import { redisConnection } from './queue.js';
 
 dotenv.config();
 
@@ -49,9 +50,9 @@ async function sendEmail(email, templateId, domainName, templateName) {
 
 let emailWorker;
 
-// ONLY create worker if UPSTASH_REDIS_URL is configured
-if (!process.env.UPSTASH_REDIS_URL) {
-    console.warn('[EmailWorker] ⚠️ UPSTASH_REDIS_URL not configured. Email campaigns will not work.');
+// ONLY create worker if REDIS_CLOUD_URL is configured
+if (!process.env.REDIS_CLOUD_URL) {
+    console.warn('[EmailWorker] ⚠️ REDIS_CLOUD_URL not configured. Email campaigns will not work.');
     emailWorker = null;
 } else {
     try {
@@ -236,7 +237,7 @@ if (!process.env.UPSTASH_REDIS_URL) {
 
     },
     {
-        connection: { url: process.env.UPSTASH_REDIS_URL },
+        connection: redisConnection,
         concurrency: 5
     }
     );

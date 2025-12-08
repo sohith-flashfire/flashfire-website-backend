@@ -25,7 +25,7 @@ The email and WhatsApp campaign features require Redis to function. Without Redi
 
 ```bash
 # Option A: Upstash Redis URL
-UPSTASH_REDIS_URL=redis://:your-password@your-redis-url.upstash.io:6379
+REDIS_CLOUD_URL=redis://:your-password@your-redis-url.upstash.io:6379
 
 # Option B: Upstash Cloud URL (alternative)
 REDIS_CLOUD_URL=redis://:your-password@your-redis-url.upstash.io:6379
@@ -139,11 +139,11 @@ When server starts, look for:
 ## **Current Configuration**
 
 The backend checks for Redis in this order:
-1. `UPSTASH_REDIS_URL` (for email campaigns)
+1. `REDIS_CLOUD_URL` (for email campaigns)
 2. `REDIS_CLOUD_URL` (fallback for email campaigns)
 3. `REDIS_HOST` + `REDIS_PORT` (for WhatsApp campaigns, defaults to localhost:6379)
 
-**Recommendation:** Use `UPSTASH_REDIS_URL` for all environments (dev + production)
+**Recommendation:** Use `REDIS_CLOUD_URL` for all environments (dev + production)
 
 ---
 

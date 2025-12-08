@@ -3,6 +3,7 @@ import dotenv from 'dotenv';
 import WatiService from './WatiService.js';
 import { WhatsAppCampaignModel } from '../Schema_Models/WhatsAppCampaign.js';
 import { CampaignBookingModel } from '../Schema_Models/CampaignBooking.js';
+import { redisConnection } from './queue.js';
 
 dotenv.config();
 
@@ -49,9 +50,9 @@ async function sendWhatsAppMessage(mobileNumber, templateName, parameters, campa
 
 let whatsappWorker;
 
-// ONLY create worker if UPSTASH_REDIS_URL is configured
-if (!process.env.UPSTASH_REDIS_URL) {
-    console.warn('[WhatsAppWorker] ⚠️ UPSTASH_REDIS_URL not configured. WhatsApp campaigns will not work.');
+// ONLY create worker if REDIS_CLOUD_URL is configured
+if (!process.env.REDIS_CLOUD_URL) {
+    console.warn('[WhatsAppWorker] ⚠️ REDIS_CLOUD_URL not configured. WhatsApp campaigns will not work.');
     whatsappWorker = null;
 } else {
     try {
@@ -181,9 +182,7 @@ if (!process.env.UPSTASH_REDIS_URL) {
         };
     },
     {
-        connection: {
-            url: process.env.UPSTASH_REDIS_URL
-        },
+        connection: redisConnection,
         limiter: {
             max: 10, // Process max 10 jobs
             duration: 1000, // per second

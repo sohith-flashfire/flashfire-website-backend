@@ -197,7 +197,7 @@
 //       await DiscordConnect(process.env.DISCORD_REMINDER_CALL_WEBHOOK_URL,`❌ Twilio call failed for ${job.data.phone}. Error: ${error.message}`);
 //     }
 //   },
-//   { connection: { url: process.env.UPSTASH_REDIS_URL } }
+//   { connection: { url: process.env.REDIS_CLOUD_URL } }
 // );
 
 // // -------------------- Base Route --------------------
@@ -224,10 +224,10 @@ import Routes from './Routes.js';
 import Connection from './Utils/ConnectDB.js';
 import cors from 'cors';
 import 'dotenv/config';
-import { callQueue } from './Utils/queue.js';
+import { callQueue, redisConnection } from './Utils/queue.js';
 import Twilio from 'twilio';
 import { DateTime } from 'luxon';
-import { Worker } from 'bullmq';
+// Worker import removed - using dedicated worker in Utils/worker.js
 import { DiscordConnect } from './Utils/DiscordConnect.js';
 import { Logger } from './Utils/Logger.js';
 import { basicFraudCheck } from './Utils/FraudScreening.js';
@@ -527,6 +527,9 @@ app.post('/calendly-webhook', async (req, res) => {
           return res.status(200).json({ message: 'Rescheduled but skipped India number' });
         }
 
+        // ✅ Use unique jobId: phone + meeting time to prevent collisions
+        const uniqueJobId = `${inviteePhone}_${newStartTime}`;
+        
         const newJob = await callQueue.add(
           'callUser',
           {
@@ -537,10 +540,15 @@ app.post('/calendly-webhook', async (req, res) => {
             eventStartISO: newStartTime,
           },
           {
-            jobId: inviteePhone,
+            jobId: uniqueJobId,  // ✅ Unique: phone + meeting time
             delay: newDelay,
             removeOnComplete: true,
-            removeOnFail: 100
+            removeOnFail: 100,
+            attempts: 3,  // ✅ Retry failed calls up to 3 times
+            backoff: {
+              type: 'exponential',
+              delay: 60000  // 1 minute, 2 minutes, 4 minutes
+            }
           }
         );
 
@@ -554,6 +562,18 @@ app.post('/calendly-webhook', async (req, res) => {
           { sort: { bookingCreatedAt: -1 } }
         );
 
+        console.log('\n🔁 ========================================');
+        console.log('🔁 [API] Meeting Rescheduled - New Call Job Created!');
+        console.log('🔁 ========================================');
+        console.log('   • New Job ID:', newJob.id);
+        console.log('   • Phone:', inviteePhone);
+        console.log('   • Name:', inviteeName);
+        console.log('   • Old Time:', DateTime.fromISO(oldStartTime, { zone: 'utc' }).setZone('Asia/Kolkata').toFormat('ff'));
+        console.log('   • New Time:', newMeetingTimeIndia);
+        console.log('   • New Delay:', Math.round(newDelay / 1000), 'seconds');
+        console.log('   • Will execute at:', new Date(Date.now() + newDelay).toLocaleString());
+        console.log('========================================\n');
+        
         Logger.info('Scheduled NEW reminder call for rescheduled meeting', { 
           phone: inviteePhone, 
           newDelayMs: newDelay,
@@ -591,8 +611,18 @@ app.post('/calendly-webhook', async (req, res) => {
       const meetingStart = new Date(payload?.scheduled_event?.start_time);
       const delay = meetingStart.getTime() - Date.now() - (10 * 60 * 1000);
 
+      // ✅ CRITICAL: Validate delay before scheduling
       if (delay < 0) {
-        Logger.warn('Meeting is too soon to schedule calls', { start: meetingStart.toISOString() });
+        Logger.warn('Meeting is too soon to schedule calls - skipping reminder', { 
+          start: meetingStart.toISOString(),
+          delayMs: delay,
+          meetingInMinutes: Math.round(-delay / 60000)
+        });
+        await DiscordConnect(process.env.DISCORD_REMINDER_CALL_WEBHOOK_URL,
+          `⚠️ Meeting too soon for reminder call: ${inviteeName} (${inviteeEmail}). Meeting in ${Math.round(-delay / 60000)} minutes.`
+        );
+        // Continue processing booking but skip call scheduling
+        // Don't return - still save booking to database
       }
 
       // ✅ Convert to different time zones
@@ -812,34 +842,81 @@ if (inviteePhone) {
 }
 
 
-      if (inviteePhone && phoneRegex.test(inviteePhone)) {
-        const job = await callQueue.add(
-  'callUser',
-  {
-    phone: inviteePhone,
-    meetingTime: meetingTimeIndia, // meetingTimeUS
-    role: 'client',
-    inviteeEmail,
-    eventStartISO: payload?.scheduled_event?.start_time,
-  },
-  {
-     jobId: inviteePhone,   // 🔑 use phone as jobId
-    delay,
-    removeOnComplete: true,  // ✅ deletes job when done
-    removeOnFail: 100        // ✅ keep last 100 failed jobs only
-  }
-);
+      // ✅ Only schedule call if delay is positive (meeting is in future)
+      if (inviteePhone && phoneRegex.test(inviteePhone) && delay > 0) {
+        // ✅ Use unique jobId: phone + meeting time to prevent collisions
+        const uniqueJobId = `${inviteePhone}_${payload?.scheduled_event?.start_time}`;
+        
+        // ✅ Check if job already exists (idempotency check)
+        const existingJob = await callQueue.getJob(uniqueJobId);
+        if (existingJob) {
+          Logger.warn('Call job already exists - skipping duplicate', {
+            jobId: uniqueJobId,
+            phone: inviteePhone,
+            existingJobState: await existingJob.getState()
+          });
+          scheduledJobs.push(`Client: ${inviteePhone} (job already exists)`);
+        } else {
+          const job = await callQueue.add(
+            'callUser',
+            {
+              phone: inviteePhone,
+              meetingTime: meetingTimeIndia,
+              role: 'client',
+              inviteeEmail,
+              eventStartISO: payload?.scheduled_event?.start_time,
+            },
+            {
+              jobId: uniqueJobId,  // ✅ Unique: phone + meeting time
+              delay,
+              removeOnComplete: true,
+              removeOnFail: 100,
+              attempts: 3,  // ✅ Retry failed calls up to 3 times
+              backoff: {
+                type: 'exponential',
+                delay: 60000  // 1 minute, 2 minutes, 4 minutes
+              }
+            }
+          );
 
-        // Store the job ID in the booking record
-        await CampaignBookingModel.findOneAndUpdate(
-          { bookingId: newBooking.bookingId },
-          { reminderCallJobId: job.id.toString() }
-        );
+          // Store the job ID in the booking record
+          await CampaignBookingModel.findOneAndUpdate(
+            { bookingId: newBooking.bookingId },
+            { reminderCallJobId: job.id.toString() }
+          );
 
-        scheduledJobs.push(`Client: ${inviteePhone}`);
-        Logger.info('Valid phone, scheduled call', { phone: inviteePhone, delayMs: delay, jobId: job.id });
-        const scheduledMessage =`Reminder Call Scheduled For ${inviteePhone}-${inviteeName} for meeting scheduled on ${meetingTimeIndia} (IST).Reminder 10 minutes before Start of meeting.`
-        await DiscordConnect(process.env.DISCORD_REMINDER_CALL_WEBHOOK_URL, scheduledMessage);
+          scheduledJobs.push(`Client: ${inviteePhone}`);
+          
+          console.log('\n📞 ========================================');
+          console.log('📞 [API] Call Reminder Job Scheduled!');
+          console.log('📞 ========================================');
+          console.log('   • Job ID:', job.id);
+          console.log('   • Unique Job ID:', uniqueJobId);
+          console.log('   • Phone:', inviteePhone);
+          console.log('   • Name:', inviteeName);
+          console.log('   • Email:', inviteeEmail);
+          console.log('   • Meeting Time:', meetingTimeIndia);
+          console.log('   • Delay:', Math.round(delay / 1000), 'seconds');
+          console.log('   • Will execute at:', new Date(Date.now() + delay).toLocaleString());
+          console.log('   • Retry attempts: 3 (exponential backoff)');
+          console.log('========================================\n');
+          
+          Logger.info('Valid phone, scheduled call', { 
+            phone: inviteePhone, 
+            delayMs: delay, 
+            jobId: job.id,
+            uniqueJobId,
+            retryAttempts: 3
+          });
+          const scheduledMessage =`📞 Reminder Call Scheduled!\n• Job ID: ${job.id}\n• Unique ID: ${uniqueJobId}\n• Client: ${inviteeName} (${inviteePhone})\n• Meeting: ${meetingTimeIndia} (IST)\n• Reminder: 10 minutes before meeting\n• Retries: 3 attempts`
+          await DiscordConnect(process.env.DISCORD_REMINDER_CALL_WEBHOOK_URL, scheduledMessage);
+        }
+      } else if (delay <= 0) {
+        Logger.warn('Skipping call scheduling - meeting too soon or invalid phone', {
+          phone: inviteePhone,
+          delayMs: delay,
+          hasValidPhone: inviteePhone && phoneRegex.test(inviteePhone)
+        });
       } else {
         Logger.warn('No valid phone number provided by invitee', { phone: inviteePhone });
         await DiscordConnect(process.env.DISCORD_REMINDER_CALL_WEBHOOK_URL,
@@ -865,100 +942,12 @@ if (inviteePhone) {
   }
 });
 app.post("/twilio-ivr", TwilioReminder);
+
 // -------------------- Worker Setup --------------------
-const client = Twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-   
-
-new Worker(
-  'callQueue',
-  async (job) => {
-    const meta = {
-      jobId: job?.id,
-      type: job?.data?.type || 'call_reminder',
-      phone: job?.data?.phone,
-      meetingTime: job?.data?.meetingTime,
-      inviteeEmail: job?.data?.inviteeEmail
-    };
-    console.log('[Worker] Processing job', meta);
-
-    try {
-      // Skip payment reminder jobs here; they are handled by the dedicated worker in Utils/worker.js
-      if (job?.data?.type === 'payment_reminder') {
-        console.log('[Worker] Skipping payment reminder job in inline worker', { jobId: job?.id });
-        return;
-      }
-
-      // Validate phone before attempting a call
-      const phone = job?.data?.phone;
-      if (!phone) {
-        console.error('[Worker] Missing phone in job data; aborting call', meta);
-        return;
-      }
-
-      const phoneRegex = /^\+?[1-9]\d{9,14}$/;
-      if (!phoneRegex.test(phone)) {
-        console.error('[Worker] Invalid E.164 phone format; aborting call', { ...meta, phone });
-        return;
-      }
-
-      if (!process.env.TWILIO_FROM) {
-        console.error('[Worker] TWILIO_FROM not configured; aborting call');
-        return;
-      }
-      // Pre-call Google Calendar presence check (optional, env-driven)
-      const calendarId = process.env.GOOGLE_CALENDAR_ID;
-      const shouldCheck = Boolean(calendarId);
-      if (shouldCheck) {
-        const present = await isEventPresent({
-          calendarId,
-          eventStartISO: job.data.eventStartISO,
-          inviteeEmail: job.data.inviteeEmail,
-          windowMinutes: 20
-        });
-        if (!present) {
-          Logger.info('Event not present in Google Calendar window; skipping call', {
-            phone: job.data.phone,
-            inviteeEmail: job.data.inviteeEmail,
-            eventStartISO: job.data.eventStartISO
-          });
-          await DiscordConnect(process.env.DISCORD_REMINDER_CALL_WEBHOOK_URL,
-            `Skipping call. Event not found in calendar window for ${job.data.phone} (${job.data.inviteeEmail || 'unknown email'}).`);
-          return;
-        }
-      }
-
-      const call = await client.calls.create({
-        to: phone,
-        from: process.env.TWILIO_FROM, // must be a Twilio voice-enabled number
-        url: `https://api.flashfirejobs.com/twilio-ivr?meetingTime=${encodeURIComponent(job.data.meetingTime)}`,
-        machineDetection: 'Enable', // basic AMD to avoid leaving awkward messages
-        // machineDetectionTimeout: 5, // optional: shorter detection window
-        statusCallback: 'https://api.flashfirejobs.com/call-status',
-        statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
-        method: 'POST', // optional (Twilio defaults to POST for Calls API)
-      });
-
-      console.log('[Worker] ✅ Call initiated', {
-        jobId: job?.id,
-        sid: call?.sid,
-        status: call?.status,
-        to: phone,
-        from: process.env.TWILIO_FROM
-      });
-      DiscordConnect(process.env.DISCORD_REMINDER_CALL_WEBHOOK_URL,`[Worker] ✅ Call initiated. SID: ${call.sid} Status: ${call.status}` )
-    } catch (error) {
-      console.error('[Worker] ❌ Twilio call failed', {
-        jobId: job?.id,
-        phone: job?.data?.phone,
-        error: error?.message,
-        code: error?.code,
-        moreInfo: error?.moreInfo
-      });
-      await DiscordConnect(process.env.DISCORD_REMINDER_CALL_WEBHOOK_URL,`❌ Twilio call failed for ${job.data.phone}. Error: ${error.message}`);
-    }
-  },
-  { connection: { url: process.env.REDIS_CLOUD_URL } }
-);
+// ✅ NOTE: Dedicated worker is in Utils/worker.js
+// ✅ This inline worker was REMOVED to prevent duplicate job processing
+// ✅ Run worker separately: npm run worker
+// ✅ This ensures only ONE worker processes jobs, preventing race conditions
 
 // -------------------- Base Route --------------------
 app.get("/", (req, res) => {
